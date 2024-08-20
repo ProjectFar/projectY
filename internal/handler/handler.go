@@ -9,15 +9,16 @@ import (
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 	"gorm.io/gorm/schema"
-	"gormtest/internal"
+	"gormtest/internal/model"
 	"net/http"
-	"strconv"
 	"time"
 )
 
 var db *gorm.DB
 var ctx = context.Background()
 var client *redis.Client
+var isAdmin bool
+var loggedUser string
 
 func Connect(c *gin.Context) {
 	var err error
@@ -40,56 +41,129 @@ func Connect(c *gin.Context) {
 		}
 	}
 
-	if err := db.AutoMigrate(&internal.Blog{}); err != nil {
+	if err := db.AutoMigrate(&model.Blog{}); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to migrate database schema"})
 		return
 	}
 
 }
 
+func Login(c *gin.Context) {
+	user := c.DefaultQuery("user", "")
+	password := c.DefaultQuery("password", "")
+
+	var adminMap = map[string]string{
+		"Faruk":  "password",
+		"Admin1": "password1",
+		"Admin2": "password2",
+		"Admin3": "password3",
+	}
+
+	var userMap = map[string]string{
+		"User1": "user1",
+		"User2": "user2",
+		"User3": "user3",
+	}
+
+	for User, Password := range adminMap {
+		if User == user && Password == password {
+			c.JSON(http.StatusOK, gin.H{"result": "Login as an admin successful"})
+			isAdmin = true
+			return
+		}
+	}
+	for User, Password := range userMap {
+		if User == user && Password == password {
+			c.JSON(http.StatusOK, gin.H{"result": "Login as a user successful"})
+			isAdmin = false
+			loggedUser = user
+			return
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"result": "Login failed please use valid credentials"})
+	isAdmin = false
+
+	return
+}
+
 func GetBloge(c *gin.Context) {
-	var bloges []internal.Blog
+	if isAdmin {
+		cacheKey := "bloges"
+		val, err := client.Get(ctx, cacheKey).Result()
+		if err == nil {
+			fmt.Println("Retrieved data from cache")
+			var bloges []model.Blog
+			err = json.Unmarshal([]byte(val), &bloges)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to unmarshal cached data"})
+				return
+			}
+			c.IndentedJSON(http.StatusOK, bloges)
+			return
+		}
 
-	if db == nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database connection is nil"})
-		return
-	}
+		var bloges []model.Blog
+		if err := db.Find(&bloges).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve blogs"})
+			return
+		}
 
-	if err := db.Find(&bloges).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve bloges"})
-		return
+		cachedData, err := json.Marshal(bloges)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to marshal data for caching"})
+			return
+		}
+
+		err = client.Set(ctx, cacheKey, cachedData, 10*time.Minute).Err()
+		if err != nil {
+			return
+		}
+		c.IndentedJSON(http.StatusOK, bloges)
+	} else {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
 	}
-	c.IndentedJSON(http.StatusOK, bloges)
 }
 
 func UpdateBlogByID(c *gin.Context) {
-	var updatedBlog internal.Blog
 	id := c.Param("id")
+	var blog model.Blog
 
-	if err := db.Where("id = ?", id).First(&updatedBlog).Error; err != nil {
+	if err := db.Where("id = ?", id).First(&blog).Error; err != nil {
 		c.IndentedJSON(http.StatusNotFound, gin.H{"error": "Blog not found"})
 		return
 	}
 
-	if err := c.ShouldBindJSON(&updatedBlog); err != nil {
+	if !isAdmin && blog.User != loggedUser {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	if err := c.ShouldBindJSON(&blog); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	db.Save(&updatedBlog)
-
-	/*// Clear the cache for the updated blog
-	cacheKey := fmt.Sprintf("blog:%s", id)
-	err := client.Del(ctx, cacheKey).Err()
+	err := db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Save(&blog).Error; err != nil {
+			return err
+		}
+		return nil
+	})
 	if err != nil {
-		fmt.Println("Failed to clear cache for updated blog:", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update blog"})
+		return
 	}
-	*/
-	c.IndentedJSON(http.StatusOK, updatedBlog)
+
+	// Clear or update the cache
+	client.Del(ctx, fmt.Sprintf("blog:%s", id))
+	client.Del(ctx, "bloges")
+
+	c.IndentedJSON(http.StatusOK, blog)
 }
+
 func GetBlogByID(c *gin.Context) {
 	id := c.Param("id")
-	var blog internal.Blog
+	var blog model.Blog
 
 	cacheKey := fmt.Sprintf("blog:%s", id)
 	val, err := client.Get(ctx, cacheKey).Result()
@@ -120,62 +194,64 @@ func GetBlogByID(c *gin.Context) {
 	if err != nil {
 		fmt.Println("Failed to cache blog:", err)
 	}
-
-	c.IndentedJSON(http.StatusOK, blog)
+	if !isAdmin && blog.User != loggedUser {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+	} else {
+		c.IndentedJSON(http.StatusOK, blog)
+	}
 }
 
 func PostBlog(c *gin.Context) {
-	var newBlog internal.Blog
+	if !isAdmin && loggedUser == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "please login"})
+	} else {
+		var newBlog model.Blog
 
-	if err := c.ShouldBindJSON(&newBlog); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	db.Create(&newBlog)
-
-	cachedData, err := json.Marshal(newBlog)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to marshal data for caching"})
-		return
-	}
-
-	cacheKey := fmt.Sprintf("blog:%d", newBlog.ID)
-	if ort := client.Set(ctx, cacheKey, cachedData, 10*time.Minute).Err; ort != nil {
-		if ctx == nil {
-			fmt.Println("ctx ist das problem")
+		if err := c.ShouldBindJSON(&newBlog); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
 		}
-		if cachedData == nil {
-			fmt.Println("chacheData ist das problem")
-		} else {
-			fmt.Println(ort)
+
+		db.Create(&newBlog)
+
+		// Clear or update the cache
+		client.Del(ctx, "bloges")
+
+		cacheKey := fmt.Sprintf("blog:%s", newBlog.ID)
+
+		cachedData, err := json.Marshal(newBlog)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to marshal data for caching"})
+			return
 		}
-		if err := ctx.Err(); err != nil {
-			fmt.Println("Failed to cache blog:", err)
+
+		err = client.Set(ctx, cacheKey, cachedData, 10*time.Minute).Err()
+		if err != nil {
+			return
 		}
+
+		c.IndentedJSON(http.StatusOK, newBlog)
 	}
-	c.IndentedJSON(http.StatusOK, newBlog)
 }
 
 func DeleteBlogByID(c *gin.Context) {
 	id := c.Param("id")
-	var blog internal.Blog
+	var blog model.Blog
 
-	if err := db.Where("id = ?", id).Delete(&blog).Error; err != nil {
-		c.IndentedJSON(http.StatusNotFound, gin.H{"error": "Blog not found"})
+	if !isAdmin && blog.User != loggedUser {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
 		return
-	}
-	idef, _ := strconv.Atoi(blog.ID)
-	clearCache(ctx, idef)
+	} else if loggedUser != "" {
+		if err := db.Where("id = ?", id).Delete(&blog).Error; err != nil {
+			c.IndentedJSON(http.StatusNotFound, gin.H{"error": "Blog not found"})
+			return
+		}
 
-	c.IndentedJSON(http.StatusOK, gin.H{"result": "Blog deleted"})
-}
+		// Clear the cache
+		client.Del(ctx, fmt.Sprintf("blog:%s", id))
+		client.Del(ctx, "bloges")
 
-func clearCache(ctx context.Context, blogID int) error {
-	key := fmt.Sprintf("blog:%d", blogID)
-	err := client.Del(ctx, key).Err()
-	if err != nil {
-		return fmt.Errorf("failed to clear cache for blog %d: %w", blogID, err)
+		c.IndentedJSON(http.StatusOK, gin.H{"result": "Blog deleted"})
 	}
-	return nil
+	c.IndentedJSON(http.StatusUnauthorized, gin.H{"error": "please login"})
 }
